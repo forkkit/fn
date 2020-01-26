@@ -47,7 +47,7 @@ func (tr *placerTracker) HandleFindRunnersFailure(err error) {
 	if ok {
 		logger = logger.WithField("root_error", w.RootError())
 	}
-	logger.Error("Failed to find runners for call")
+	logger.Warn("Failed to find runners for call")
 	stats.Record(tr.requestCtx, errorPoolCountMeasure.M(0))
 }
 
@@ -113,12 +113,27 @@ func (tr *placerTracker) HandleDone() {
 
 // RetryAllBackoff blocks until it is time to try the runner list again. Returns
 // false if the placer should stop trying.
-func (tr *placerTracker) RetryAllBackoff(numOfRunners int) bool {
-
+func (tr *placerTracker) RetryAllBackoff(numOfRunners int, err error) bool {
 	// This means Placer is operating on an empty list. No runners
-	// available. Record it.
+	// available. Record it. ALWAYS do this before failing fast.
 	if numOfRunners == 0 {
 		stats.Record(tr.requestCtx, emptyPoolCountMeasure.M(0))
+	}
+
+	// If there are no runners and last call to provision runners failed due
+	// to a user error (or misconfiguration) then fail fast.
+	if numOfRunners == 0 && err != nil {
+		// IsFuncError currently synonymous with tag: 'blame == user'
+		// See: runner_fninvoke.handleFnInvokeCall2
+		if models.IsFuncError(err) {
+			// We also sanity check for a 502 before returning.
+			w, ok := err.(models.APIError)
+			if ok {
+				if 502 == w.Code() {
+					return false
+				}
+			}
+		}
 	}
 
 	t := common.NewTimer(tr.cfg.RetryAllDelay)

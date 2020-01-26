@@ -35,7 +35,8 @@ var (
 
 const (
 	// max buffer size for grpc data messages, 10K
-	MaxDataChunk = 10 * 1024
+	MaxDataChunk          = 10 * 1024
+	DefaultConnectTimeout = 100 * time.Millisecond
 )
 
 type gRPCRunner struct {
@@ -52,7 +53,12 @@ func (r *gRPCRunner) Close(context.Context) error {
 }
 
 func NewgRPCRunner(addr string, tlsConf *tls.Config, dialOpts ...grpc.DialOption) (pool.Runner, error) {
-	conn, client, err := runnerConnection(addr, tlsConf, dialOpts...)
+	runner, err := NewgRPCRunnerWithTimeout(addr, tlsConf, DefaultConnectTimeout, dialOpts...)
+	return runner, err
+}
+
+func NewgRPCRunnerWithTimeout(addr string, tlsConf *tls.Config, timeout time.Duration, dialOpts ...grpc.DialOption) (pool.Runner, error) {
+	conn, client, err := runnerConnection(addr, tlsConf, timeout, dialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +72,7 @@ func NewgRPCRunner(addr string, tlsConf *tls.Config, dialOpts ...grpc.DialOption
 
 }
 
-func runnerConnection(address string, tlsConf *tls.Config, dialOpts ...grpc.DialOption) (*grpc.ClientConn, pb.RunnerProtocolClient, error) {
+func runnerConnection(address string, tlsConf *tls.Config, timeout time.Duration, dialOpts ...grpc.DialOption) (*grpc.ClientConn, pb.RunnerProtocolClient, error) {
 
 	ctx := context.Background()
 	logger := common.Logger(ctx).WithField("runner_addr", address)
@@ -78,7 +84,7 @@ func runnerConnection(address string, tlsConf *tls.Config, dialOpts ...grpc.Dial
 	}
 
 	// we want to set a very short timeout to fail-fast if something goes wrong
-	conn, err := grpcutil.DialWithBackoff(ctx, address, creds, 100*time.Millisecond, grpc.DefaultBackoffConfig, dialOpts...)
+	conn, err := grpcutil.DialWithBackoff(ctx, address, creds, timeout, grpc.DefaultBackoffConfig, dialOpts...)
 	if err != nil {
 		logger.WithError(err).Error("Unable to connect to runner node")
 	}
@@ -386,8 +392,8 @@ DataLoop:
 				span.Annotate([]trace.Attribute{trace.StringAttribute("status", infoMsg)}, "")
 				log.Debugf(infoMsg)
 				for _, header := range meta.Http.Headers {
-					clonedHeaders.Set(header.Key, header.Value)
-					w.Header().Set(header.Key, header.Value)
+					clonedHeaders.Add(header.Key, header.Value)
+					w.Header().Add(header.Key, header.Value)
 				}
 				if meta.Http.StatusCode > 0 {
 					statusCode = meta.Http.StatusCode
@@ -475,17 +481,41 @@ DataLoop:
 }
 
 func logCallFinish(log logrus.FieldLogger, msg *pb.RunnerMsg_Finished, headers http.Header, httpStatus int32) {
-	errorCode := msg.Finished.GetErrorCode()
-	errorUser := msg.Finished.GetErrorUser()
-	runnerSuccess := msg.Finished.GetSuccess()
+
+	fin := msg.Finished
+
+	errorCode := fin.GetErrorCode()
+	errorUser := fin.GetErrorUser()
+	runnerSuccess := fin.GetSuccess()
+
+	// duration all in msecs units below
+
+	// call start/end latencies:
+	execDur := fin.GetExecutionDuration()  // fn exec elapsed time (exec-time under slot)
+	schedDur := fin.GetSchedulerDuration() // fn scheduler elapsed time (until slot acquisition)
+
+	// container (slot) latencies:
+	imgWaitDur := fin.GetImagePullWaitDuration() // fn waiting for image to be available
+	cntrCreatDur := fin.GetCtrCreateDuration()   // eg. container create/attach/start
+	cntrPrepDur := fin.GetCtrPrepDuration()      // eg. tmpfs setup
+	cntrInitDur := fin.GetInitStartTime()        // eg. fdk init, UDS wait, etc.
+
 	logger := log.WithFields(logrus.Fields{
-		"function_error":     msg.Finished.GetErrorStr(),
+		"function_error":     fin.GetErrorStr(),
 		"runner_success":     runnerSuccess,
 		"runner_error_code":  errorCode,
 		"runner_error_user":  errorUser,
 		"runner_http_status": httpStatus,
+		"function_exec_msec": execDur,
+		"runner_sched_msec":  schedDur,
+		"img_wait_msec":      imgWaitDur,
+		"cntr_create_msec":   cntrCreatDur,
+		"cntr_prep_msec":     cntrPrepDur,
+		"cntr_init_msec":     cntrInitDur,
 		"fn_http_status":     headers.Get("Fn-Http-Status"),
+		"fn_fdk_version":     headers.Get("Fn-Fdk-Version"),
 	})
+
 	if !runnerSuccess && !errorUser && errorCode != http.StatusServiceUnavailable {
 		logger.Warn("Call finished")
 	} else {

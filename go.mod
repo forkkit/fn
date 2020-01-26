@@ -6,6 +6,7 @@ require (
 	contrib.go.opencensus.io/exporter/jaeger v0.1.0
 	contrib.go.opencensus.io/exporter/prometheus v0.1.0
 	contrib.go.opencensus.io/exporter/zipkin v0.1.1
+	github.com/Microsoft/go-winio v0.4.14 // indirect
 	github.com/coreos/go-semver v0.2.1-0.20180108230905-e214231b295a
 	github.com/dchest/siphash v1.2.0
 	github.com/fnproject/fdk-go v0.0.0-20181025170718-26ed643bea68
@@ -28,6 +29,7 @@ require (
 	github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742 // indirect
 	github.com/openzipkin/zipkin-go v0.1.6
 	github.com/patrickmn/go-cache v2.1.0+incompatible
+	github.com/pkg/errors v0.8.1
 	github.com/prometheus/client_golang v0.9.3-0.20190127221311-3c4408c8b829
 	github.com/sirupsen/logrus v1.3.0
 	github.com/stretchr/testify v1.3.0
@@ -46,3 +48,5 @@ replace (
 	github.com/Azure/go-ansiterm => ./noop/noop1
 	github.com/Microsoft/go-winio => ./noop/noop2
 )
+
+go 1.13

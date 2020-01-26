@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -20,12 +21,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fnproject/fn/api/agent/drivers"
 	_ "github.com/fnproject/fn/api/agent/drivers/docker"
 	"github.com/fnproject/fn/api/common"
 	"github.com/fnproject/fn/api/id"
 	"github.com/fnproject/fn/api/models"
 
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 )
 
 func init() {
@@ -1284,7 +1287,7 @@ func TestDockerAuthExtn(t *testing.T) {
 
 	errC := make(chan error, 10)
 
-	c := newHotContainer(ctx, nil, call, cfg, id.New().String(), "", errC)
+	c := newHotContainer(ctx, nil, nil, call, cfg, id.New().String(), "", errC)
 	if c == nil {
 		err := <-errC
 		t.Fatal("got unexpected err: ", err)
@@ -1297,7 +1300,7 @@ func TestDockerAuthExtn(t *testing.T) {
 		t.Fatal("got unexpected err: ", err)
 	}
 
-	c = newHotContainer(ctx, nil, call, cfg, id.New().String(), "TestRegistryToken", errC)
+	c = newHotContainer(ctx, nil, nil, call, cfg, id.New().String(), "TestRegistryToken", errC)
 	if c == nil {
 		err := <-errC
 		t.Fatal("got unexpected err: ", err)
@@ -1405,7 +1408,7 @@ func TestContainerDisableIO(t *testing.T) {
 
 	errC := make(chan error, 10)
 
-	c := newHotContainer(ctx, nil, call, cfg, id.New().String(), "", errC)
+	c := newHotContainer(ctx, nil, nil, call, cfg, id.New().String(), "", errC)
 	if c == nil {
 		err := <-errC
 		t.Fatal("got unexpected err: ", err)
@@ -1432,4 +1435,379 @@ func TestContainerDisableIO(t *testing.T) {
 	if !stderrOff {
 		t.Error("stderr is enabled, stderr should be disabled")
 	}
+}
+
+func TestSlotErrorRetention(t *testing.T) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(10*time.Second))
+	defer cancel()
+
+	app := &models.App{ID: "app_id"}
+	fn := &models.Fn{
+		ID:     "fn_id",
+		Image:  "fnproject/fn-test-utils",
+		Config: models.Config{"ENABLE_INIT_DELAY_MSEC": "100"},
+		ResourceConfig: models.ResourceConfig{
+			Timeout:     5,
+			IdleTimeout: 10,
+			Memory:      128,
+		},
+	}
+
+	url := "http://127.0.0.1:8080/invoke/" + fn.ID
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatalf("error %v in agent config cfg=%+v", err, cfg)
+	}
+	cfg.EnableFDKDebugInfo = true
+
+	a := New(WithConfig(cfg))
+
+	defer checkClose(t, a)
+
+	const echoContent = "parsley"
+	const concurrency = 2
+
+	var uniqId string
+
+	checkBody := func(res *http.Response) {
+		var resp struct {
+			R struct {
+				Body string `json:"echoContent"`
+			} `json:"request"`
+		}
+
+		json.NewDecoder(res.Body).Decode(&resp)
+		if resp.R.Body != echoContent {
+			t.Fatalf(`didn't get a %s in the body: %s`, echoContent, resp.R.Body)
+		}
+
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
+	}
+
+	// just spawn a container
+	{
+		body := fmt.Sprintf(`{"sleepTime": 0, "echoContent":"%s"}`, echoContent)
+
+		req, err := http.NewRequest("GET", url, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("unexpected error building request %v", err)
+		}
+		req = req.WithContext(ctx)
+
+		var out bytes.Buffer
+		callI, err := a.GetCall(FromHTTPFnRequest(app, fn, req), WithWriter(&out))
+		if err != nil {
+			t.Fatalf("unexpected error building call %v", err)
+		}
+
+		uniqId = callI.Model().ID
+		callI.Model().Config["ENABLE_FAIL_IF_FN_SPAWN_CALL_ID_NONMATCH"] = uniqId
+		callI.Model().Config["ENABLE_FAIL_IF_FN_SPAWN_CALL_ID_NONMATCH_MSEC"] = "100"
+
+		err = a.Submit(callI)
+		if err != nil {
+			t.Fatalf("submit should not error %v", err)
+		}
+
+		res, err := http.ReadResponse(bufio.NewReader(&out), nil)
+		if err != nil {
+			t.Fatalf("read resp should not error %v", err)
+		}
+
+		checkBody(res)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	for idx := 0; idx < concurrency; idx++ {
+		go func(id int) {
+			defer wg.Done()
+			dctx, cancel := context.WithTimeout(ctx, time.Duration(1000*time.Millisecond))
+			defer cancel()
+
+			for dctx.Err() == nil {
+
+				body := fmt.Sprintf(`{"sleepTime": 5, "echoContent":"%s"}`, echoContent)
+				req, err := http.NewRequest("GET", url, strings.NewReader(body))
+				if err != nil {
+					t.Fatalf("unexpected error building request %v", err)
+				}
+				req = req.WithContext(ctx)
+
+				var out bytes.Buffer
+				callI, err := a.GetCall(FromHTTPFnRequest(app, fn, req), WithWriter(&out))
+				if err != nil {
+					t.Fatalf("unexpected error building call %v", err)
+				}
+
+				callI.Model().Config["ENABLE_FAIL_IF_FN_SPAWN_CALL_ID_NONMATCH"] = uniqId
+				callI.Model().Config["ENABLE_FAIL_IF_FN_SPAWN_CALL_ID_NONMATCH_MSEC"] = "100"
+
+				err = a.Submit(callI)
+				if err != nil {
+					t.Fatalf("submit should not error %v", err)
+				}
+
+				res, err := http.ReadResponse(bufio.NewReader(&out), nil)
+				if err != nil {
+					t.Fatalf("read resp should not error %v", err)
+				}
+
+				checkBody(res)
+			}
+		}(idx)
+	}
+
+	wg.Wait()
+}
+
+// Custom driver
+type customDriver struct {
+	drv drivers.Driver
+
+	isClosed bool
+	isBefore bool
+	isAfter  bool
+
+	beforeFn drivers.BeforeCall
+	afterFn  drivers.AfterCall
+	closeFn  func()
+}
+
+// implements Driver
+func (d *customDriver) CreateCookie(ctx context.Context, task drivers.ContainerTask) (drivers.Cookie, error) {
+	cookie, err := d.drv.CreateCookie(ctx, task)
+	if err != nil {
+		return cookie, err
+	}
+
+	task.WrapClose(func(closer func()) func() {
+		return func() {
+			closer()
+			d.isClosed = true
+			if d.closeFn != nil {
+				d.closeFn()
+			}
+		}
+	})
+
+	task.WrapBeforeCall(func(before drivers.BeforeCall) drivers.BeforeCall {
+		return func(ctx context.Context, call *models.Call, extn drivers.CallExtensions) error {
+			err := before(ctx, call, extn)
+			if err != nil {
+				logrus.WithError(err).Fatal("expected no error but got")
+				return err
+			}
+			d.isBefore = true
+			if d.beforeFn != nil {
+				return d.beforeFn(ctx, call, extn)
+			}
+			return nil
+		}
+	})
+
+	task.WrapAfterCall(func(after drivers.AfterCall) drivers.AfterCall {
+		return func(ctx context.Context, call *models.Call, extn drivers.CallExtensions) error {
+			err := after(ctx, call, extn)
+			if err != nil {
+				logrus.WithError(err).Fatal("expected no error but got")
+				return err
+			}
+			d.isAfter = true
+			if d.afterFn != nil {
+				return d.afterFn(ctx, call, extn)
+			}
+			return nil
+		}
+	})
+
+	return cookie, nil
+}
+
+// implements Driver
+func (d *customDriver) SetPullImageRetryPolicy(policy common.BackOffConfig, checker drivers.RetryErrorChecker) error {
+	return d.drv.SetPullImageRetryPolicy(policy, checker)
+}
+
+// implements Driver
+func (d *customDriver) Close() error {
+	return d.drv.Close()
+}
+
+// implements Driver
+func (d *customDriver) GetSlotKeyExtensions(extn map[string]string) string {
+	return d.drv.GetSlotKeyExtensions(extn)
+}
+
+var _ drivers.Driver = &customDriver{}
+
+func createModelCall(appId string) *models.Call {
+	app := &models.App{ID: appId, Name: "myapp"}
+	fn := &models.Fn{ID: "fn_id", AppID: app.ID}
+
+	image := "fnproject/fn-test-utils"
+	const timeout = 10
+	const idleTimeout = 20
+	const memory = 256
+	method := "GET"
+	url := "http://127.0.0.1:8080/invoke/" + fn.ID
+	payload := `{isDebug": true}`
+	typ := "sync"
+	config := map[string]string{
+		"FN_LISTENER": "unix:" + filepath.Join(iofsDockerMountDest, udsFilename),
+		"FN_APP_ID":   app.ID,
+		"FN_FN_ID":    fn.ID,
+		"FN_MEMORY":   strconv.Itoa(memory),
+		"FN_TYPE":     typ,
+	}
+
+	cm := &models.Call{
+		AppID:       app.ID,
+		FnID:        fn.ID,
+		Config:      config,
+		Image:       image,
+		Type:        typ,
+		Timeout:     timeout,
+		IdleTimeout: idleTimeout,
+		Memory:      memory,
+		Payload:     payload,
+		URL:         url,
+		Method:      method,
+	}
+	return cm
+}
+
+func TestContainerBeforeAfterWrapOK(t *testing.T) {
+	cm := createModelCall("TestContainerBeforeAfterWrapOK")
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drv, err := NewDockerDriver(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cust := &customDriver{
+		drv: drv,
+	}
+
+	opts := []Option{}
+	opts = append(opts, WithConfig(cfg))
+	opts = append(opts, WithDockerDriver(cust))
+
+	a := New(opts...)
+	defer checkClose(t, a)
+
+	callI, err := a.GetCall(FromModel(cm))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = a.Submit(callI)
+	if err != nil {
+		t.Fatalf("not expected error but got %v", err)
+	}
+
+	<-time.After(time.Duration(1 * time.Second))
+	assert.Equal(t, cust.isClosed, false)
+	assert.Equal(t, cust.isBefore, true)
+	assert.Equal(t, cust.isAfter, true)
+}
+
+func TestContainerBeforeWrapNotOK(t *testing.T) {
+	cm := createModelCall("TestContainerBeforeWrapNotOK")
+
+	specialErr := errors.New("foo")
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drv, err := NewDockerDriver(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cust := &customDriver{
+		drv: drv,
+		beforeFn: func(ctx context.Context, call *models.Call, extn drivers.CallExtensions) error {
+			return specialErr
+		},
+	}
+
+	opts := []Option{}
+	opts = append(opts, WithConfig(cfg))
+	opts = append(opts, WithDockerDriver(cust))
+
+	a := New(opts...)
+	defer checkClose(t, a)
+
+	callI, err := a.GetCall(FromModel(cm))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = a.Submit(callI)
+	if err != specialErr {
+		t.Fatalf("expected special error but got %v", err)
+	}
+
+	<-time.After(time.Duration(1 * time.Second))
+	assert.Equal(t, cust.isClosed, true)
+	assert.Equal(t, cust.isBefore, true)
+	assert.Equal(t, cust.isAfter, false)
+}
+
+func TestContainerAfterWrapNotOK(t *testing.T) {
+	cm := createModelCall("TestContainerAfterWrapNotOK")
+
+	specialErr := errors.New("foo")
+
+	cfg, err := NewConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drv, err := NewDockerDriver(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cust := &customDriver{
+		drv: drv,
+		afterFn: func(ctx context.Context, call *models.Call, extn drivers.CallExtensions) error {
+			return specialErr
+		},
+	}
+
+	opts := []Option{}
+	opts = append(opts, WithConfig(cfg))
+	opts = append(opts, WithDockerDriver(cust))
+
+	a := New(opts...)
+	defer checkClose(t, a)
+
+	callI, err := a.GetCall(FromModel(cm))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = a.Submit(callI)
+	if err != specialErr {
+		t.Fatalf("expected special error but got %v", err)
+	}
+
+	<-time.After(time.Duration(1 * time.Second))
+	assert.Equal(t, cust.isClosed, true)
+	assert.Equal(t, cust.isBefore, true)
+	assert.Equal(t, cust.isAfter, true)
 }
